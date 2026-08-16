@@ -324,6 +324,14 @@ const CAM_SRC=2, CAM_OFF_X=0x22, CAM_OFF_Y=0x16, CAM_MAX_X=0x42, CAM_MAX_Y=0x5A;
 const F_HEALTH_D=0x01, F_SCORE_D=0x02, F_KEY_GAIN=0x04, F_KEY_SPEND=0x08,
       F_POT_GAIN=0x10, F_POT_SPEND=0x20, F_EXITING=0x40, F_DEAD=0x80;
 
+/* $7D1C -- the potion's three parameters, dumped from live RAM.  The index is
+   ((IX+$15) >> 2) & 12, plus 4 while the caster is mid-teleport, so entries
+   are FOUR bytes apart and only three of each are read.  Reading it with a
+   stride of 3 produces plausible nonsense, which is what a first pass at this
+   did.  Fields: [$84A3, (IY+$25), (IY+$26)]. */
+const POTION_ROWS = [[0x00,0x10,0x10],[0x01,0x10,0x10],[0x02,0x18,0x10],
+                     [0x03,0x18,0x18],[0x03,0x18,0x18]];
+
 /* $847E bits 4 and 5 -- THE TWO-PLAYER FRIENDLY-FIRE MODE, set per level
    from the dungeon record's own flags byte ($97CB) and announced by the
    level banner.  Bit 4 makes a player's shot STUN the other for 30 passes;
@@ -3410,6 +3418,18 @@ class Game{
        which are stale garbage until the first shot; state $FF = no shot. */
     this.shot = {x: A.player.block[0x10], y: A.player.block[0x11],
                  state: 0xFF, drawX: 0, drawY: 0, drawn: false};
+    /* THE POTION, armed by $A518 and spent over five passes.  All of it is
+       GLOBAL, not per-player: one sweep exists at a time whoever threw it.
+         potionT     $84A1  the countdown, decremented at $8546 in the loop
+         potionArmed $847E bit 3
+         potionK     $84A3  the class the sweep reports (not yet consumed)
+         potionLo/Hi (IY+$25)/(IY+$26)  damage for state < $20 / >= $20
+         potionBy    $84A6  which player threw it
+         killTally   $84A2  BCD, every MONSTER the sweep touched
+         genTally    $84B2  BCD, every GENERATOR it removed              */
+    this.potionT = 0; this.potionArmed = false; this.f847E_bit0 = 0;
+    this.potionK = 0; this.potionLo = 0; this.potionHi = 0; this.potionBy = 0;
+    this.killTally = 0; this.genTally = 0;
     this.b3 = 0;                    // $84B3, the class-5 potion bounty
     /* $93CD's aftermath.  dead is (IX+$14) bit 7; levelDone is $847D bit 7,
        which is the flag the MAIN LOOP ITSELF tests at $8556 before jumping
@@ -4132,6 +4152,18 @@ class Game{
      player 1 whether or not they touched.  Reproduced.                  */
   playerPass(){
     const [p1, p2] = this.players;
+    /* $A38D RES 3,(IY-1) / $A391 BIT 0,(IY-1) / JR z / $A397 SET 3,(IY-1).
+       THE SWEEP IS DISARMED AT THE TOP OF EVERY PASS and re-armed only while
+       $847E bit 0 is set.  So a thrown potion kills for the REMAINDER OF THE
+       PASS IT WAS THROWN ON, not for the five passes $84A1 counts.
+       MEASURED, and it is why this is written this way: holding MAGIC on the
+       real Z80 gives armed = 1 on the throwing pass and 0 on the very next,
+       while $84A1 runs on 4,3,2,1,0 underneath.  A first version of this port
+       cleared the flag when the countdown expired and would have left the
+       sweep killing five times too long.
+       PROVISIONAL: what SETS $847E bit 0 has not been established, so the
+       sustain arm is modelled but never taken here. */
+    this.potionArmed = !!(this.f847E_bit0);              // $A38D / $A397
     if (p1.animCtl & 0x08){                              // $A39B BIT 3,$842E
       this.shove(p1, p2);                                // $A3BE CALL $AAF5
       this.playerUpdate(p2);                             // $A3C1 PLAYER 2
@@ -4352,6 +4384,88 @@ class Game{
     }
     this.lastBlocked = 'actor @'+ob.x+','+ob.y;
     return true;
+  }
+
+  /* $AF5D -- ONE actor's share of an armed potion.  Returns the actor's new
+     state byte, or NULL if it died (the original signals that by discarding
+     two return addresses, so its caller never resumes).
+
+       $AF5D  LD A,E / CP $A0 / JR c,$AF72     ; >= $A0 is a GENERATOR
+       $AF62    $84B2 = BCD($84B2 + 1)         ; ...tallied separately
+       $AF6B    CALL $AE7E                     ; remove it (swap-with-last)
+       $AF6E    POP AF / EXX / POP AF / RET    ; and ABANDON the update
+       $AF72  $84A2 = BCD($84A2 + 1)           ; a monster: tally it
+       $AF7B  D = (IY+$25) if E < $20 else (IY+$26)
+       $AF86  A = E & $18 / SUB D / JR c,$AF6B ; not enough HP -> it dies
+       $AF8B  E = E - D                        ; else knock the HP field down
+
+     Note the tallies count every actor the sweep TOUCHES, not every kill --
+     $AF72 increments before the damage is even chosen. */
+  potionHit(i, E){
+    if (E >= 0xA0){                                     // $AF5E CP $A0
+      this.genTally = daaAdd(this.genTally, 1, 0).v;    // $AF62 ADD 1 / DAA
+      this.actorRemove(i);                              // $AF6B CALL $AE7E
+      return null;                                      // $AF6E the unwind
+    }
+    this.killTally = daaAdd(this.killTally, 1, 0).v;    // $AF72 ADD 1 / DAA
+    const d = (E < 0x20) ? this.potionLo : this.potionHi;   // $AF7C/$AF83
+    if (((E & 0x18) - d) < 0){                          // $AF86 SUB D / JR c
+      this.actorRemove(i);
+      return null;
+    }
+    return (E - d) & 0xFF;                              // $AF8B
+  }
+
+  /* ====================================================================
+     $A518 -- THROW A POTION, and it ARMS a global sweep rather than acting
+     ====================================================================
+       $A518  BIT 5,(IX+7) / JR z              ; the MAGIC key (CAPS / SPACE)
+       $A51E  LD A,($84A1) / OR A / JR nz      ; a sweep is already counting
+       $A524  BIT 3,(IY-1) / JR nz             ; ...or already armed
+       $A52A  LD A,(IX+9) / OR A / JR nz,$A537
+       $A530    LD A,13 / CALL $BA2B / JR      ; NO POTIONS -> just the sound
+       $A537  BIT 5,(IX+11) / JR nz            ; the F_POT_SPEND debounce:
+                                               ;   holding the key throws ONE
+       $A53D  DEC (IX+9) / SET 5,(IX+11)       ; spend it, flag the HUD
+       $A544  LD A,(IX+$15) / RRCA / RRCA / AND 12    ; the character's row...
+       $A54B  BIT 2,(IX+$14) / JR z / ADD A,4        ; ...+4 while TELEPORTING
+       $A553  LD HL,$7D1C / ADD A,L / LD L,A         ; STRIDE 4, not 3 --
+       $A558  three bytes -> $84A3, (IY+$25), (IY+$26)
+       $A566  LD ($84A6),IX                    ; who cast it
+       $A56A  SET 3,(IY-1)                     ; ARMED
+       $A56E  $84A2 = $84B2 = 0                ; the two BCD tallies
+       $A575  LD (IY+$22),5                    ; $84A1 -- five passes
+       $A579  LD A,5 / CALL $BA2B
+
+     The parameter table, dumped from live RAM at $7D1C with the stride the
+     AND 12 implies (an earlier read of this file sliced it in threes and got
+     nonsense):
+         +0   00 10 10      +4   01 10 10     +8   02 18 10
+        +12   03 18 18     +16   03 18 18
+     (IY+$25) is the damage dealt to an actor whose state is < $20 and
+     (IY+$26) to the rest -- see potionHit(). */
+  throwPotion(){
+    if (!(this.dir & DIR_POTION)) return;                 // $A518
+    if (this.potionT !== 0) return;                       // $A51E
+    if (this.potionArmed) return;                         // $A524
+    if (this.potions === 0){                              // $A52A
+      this.sfx(13);                                       // $A530
+      return;
+    }
+    if (this.f11 & F_POT_SPEND) return;                   // $A537 debounce
+    this.potions--;                                       // $A53D
+    this.f11 |= F_POT_SPEND;                              // $A540
+    let idx = (this.p15 >> 2) & 12;                       // $A544
+    if (this.animCtl & 4) idx += 4;                       // $A54B, in flight
+    const row = POTION_ROWS[idx >> 2];
+    this.potionK = row[0];                                // $84A3
+    this.potionLo = row[1];                               // (IY+$25)
+    this.potionHi = row[2];                               // (IY+$26)
+    this.potionBy = this.p.idx;                           // $84A6
+    this.potionArmed = true;                              // $A56A
+    this.killTally = 0; this.genTally = 0;                // $A56E
+    this.potionT = 5;                                     // $A575
+    this.sfx(5);                                          // $A579
   }
 
   /* $A641 / $AE7E -- removal is a SWAP-WITH-LAST, not a splice: the record at
@@ -5382,8 +5496,18 @@ class Game{
     const a = this.actors[i];
     let E = a.state;                        // $AC00 LD A,(IX+2) / LD E,A
     let facing = a.state & 7;               // $AC04 AND 7 / EX AF,AF'  (A')
-    /* $AC07 BIT 3,(IY-1) / CALL nz,$AF5D -- the potion's "damage everything
-       on screen" sweep.  NOT PORTED: no potion is pickable in this engine. */
+    /* $AC07 BIT 3,(IY-1) / CALL nz,$AF5D -- the potion sweep, applied to THIS
+       actor as its update begins.  There is no radius test: while the flag is
+       up every actor the round robin reaches is hit, which is why a potion
+       clears the screen over the five passes $84A1 counts down rather than
+       instantly.  potionHit() returns false when it killed the actor, and the
+       original signals that by DISCARDING TWO RETURN ADDRESSES ($AF6E POP AF /
+       EXX / POP AF / RET) -- the C1 idiom, "abandon the rest of this update". */
+    if (this.potionArmed){                              // $AC07 BIT 3,(IY-1)
+      const r = this.potionHit(i, E);                   // $AC0B CALL nz,$AF5D
+      if (r === null) return;                           // killed: unwound
+      E = r;
+    }
 
     /* $AC0E  LD A,IXL / RRA / RRA / XOR (IY+$12) / RRA / JR c
        IXL = 4*slot, so the carry after the third RRA is (slot ^ pass) & 1:
@@ -6277,6 +6401,16 @@ class Game{
     }
     this.passPhase = 1.77;
     this.bannerPass();                       // $8543 CALL $891C
+    /* $8546 LD A,($84A1) / OR A / JR z,$8550 / DEC A / LD ($84A1),A -- the
+       potion countdown, and it is inline in the main loop rather than in a
+       subsystem.  When it reaches zero the sweep DISARMS: $847E bit 3 is what
+       $AC07 tests per actor, so five passes is exactly how long a thrown
+       potion keeps killing.  Cleared here rather than in throwPotion() so a
+       second throw cannot start until the first has finished, which is what
+       $A51E's own "($84A1) must be 0" guard is for. */
+    if (this.potionT !== 0){                 // $8546 / $8549
+      this.potionT--;                        // $854C / $854D
+    }
     /* ==== $8546/$8550: WHAT THIS PASS COST ==========================
        The census is complete, so charge it.  quantise() runs the identity
        cost = ceil((t + W1)/FRAME_T)*FRAME_T + W2 - t and sets passFrames
@@ -6712,9 +6846,8 @@ class Game{
          does nothing else.  See stunTick(). */
     } else {
       this.pend = 0;                      // $A514 LD (IX+$1D),0 -- EVERY pass
-      /* $A518 BIT 5,(IX+7) -- THROW A POTION.  Not ported: the sweep it runs
-         ($AF5D) is not either, and no potion is pickable in this dungeon.
-         The bit itself is modelled so the input byte is complete.
+      this.throwPotion();                 // $A518 BIT 5,(IX+7)
+      /*
 
          $A57E..$A58E -- HOLDING FIRE FREEZES THE PLAYER, and this is a real
          rule, not a side effect:
