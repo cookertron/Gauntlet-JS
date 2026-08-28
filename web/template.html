@@ -2379,12 +2379,21 @@ const FE_ENTER = [6, 0];
      $85A7  BIT 0,(IY+7)  SPACE      -> OR $20 -> ($8447)   player 2       */
 const CTRL_KEMPSTON = 1;
 /* [up, down, left, right, fire] per method per player; the Kempston arm has
-   no key list because it reads a port. */
+   no key list because it reads a port.  The KEYBOARD rows carry a SIXTH,
+   ADDED slot -- POTION -- which only exists for the rebindable method (the
+   original has no such binding anywhere; magic is $857E/$85A7's fixed
+   CAPS/SPACE, outside the dispatch).  Player 1's default is CAPS, the same
+   key the faithful read uses.  Player 2's default is N, NOT the faithful
+   SPACE -- deliberately, because SPACE is the single most-wanted FIRE
+   binding of the whole Spectrum era (QAOP + SPACE), and a default that
+   parks player 2's potion on it would make the classic layout collide out
+   of the box.  The faithful SPACE behaviour is untouched on the faithful
+   path -- see zonePotion below. */
 const CTRL_KEYS = [
-  [['9', '8', '6', '7', '0'], ['4', '3', '1', '2', '5']],   // 0 SINCLAIR
-  [null, null],                                             // 1 KEMPSTON
-  [['7', '6', '5', '8', '0'], ['7', '6', '5', '8', '0']],   // 2 PROTEK, shared
-  [['1', 'Q', 'S', 'D', 'Z'], ['8', 'I', 'K', 'L', 'M']],   // 3 KEYBOARD
+  [['9', '8', '6', '7', '0'], ['4', '3', '1', '2', '5']],           // 0 SINCLAIR
+  [null, null],                                                     // 1 KEMPSTON
+  [['7', '6', '5', '8', '0'], ['7', '6', '5', '8', '0']],           // 2 PROTEK, shared
+  [['1', 'Q', 'S', 'D', 'Z', 'CAPS'], ['8', 'I', 'K', 'L', 'M', 'N']], // 3 KEYBOARD
 ];
 const CTRL_MAGIC = ['CAPS', 'SPACE'];       // $857E / $85A7
 /* $8680 -- IN A,($1F), ACTIVE HIGH, standard Kempston bit order.  Measured
@@ -2395,8 +2404,9 @@ const KEMPSTON_MAP = [[0x01, DIR_RIGHT], [0x02, DIR_LEFT], [0x04, DIR_DOWN],
    all (there is no sixth bit for it to be; $01/$02/$04/$08/$10 above are
    the whole port).  Reported from play: a wireless controller can be
    nowhere near the keyboard MAGIC needs ($857E/$85A7, CAPS/SPACE, read
-   below regardless of method -- faithfully, since that is genuinely
-   outside the original's own dispatch), so a joystick-only player needs a
+   below on the FAITHFUL path regardless of method -- see zonePotion --
+   since that is genuinely outside the original's own dispatch), so a
+   joystick-only player needs a
    button of his own for it or he cannot use potions at all.  padBits()
    sets this bit; nothing on the real hardware ever will. */
 const KEMPSTON_POTION = 0x20;
@@ -2427,6 +2437,26 @@ let indepGamepads = false;
    around its two traces, exactly as the other two flags get flipped for
    their own faithful-path checks -- only the SHIPPED default differs. */
 let FAITHFUL_SYM_CHEAT = false;
+/* ADDED, not ported: WHERE the potion comes from.  False -- the default,
+   and what every gate and headless check outside its own tests runs with --
+   is the faithful wiring: $857E/$85A7 read CAPS (player 1) and SPACE
+   (player 2) unconditionally, OUTSIDE the method dispatch, so those two
+   keys cast magic no matter what either player is doing or holding them
+   for.  True -- set only by the streamlined options screen's handover
+   (optFinish() -> feHandover(), the same wire indepGamepads rides) -- each
+   player's potion comes from THEIR OWN input path instead: a KEYBOARD
+   player reads the sixth, rebindable slot of their own zone (see
+   CTRL_KEYS), a CONTROLLER player reads the pad's own potion bit (see
+   KEMPSTON_POTION), and the unconditional CAPS/SPACE reads are OFF.
+   Why it exists at all: with the unconditional reads live, a player who
+   binds FIRE to SPACE -- the single most classic Spectrum layout there is,
+   QAOP + SPACE -- casts PLAYER 2's magic on every shot, and a player 2 who
+   binds anything to CAPS casts player 1's.  Those were documented as
+   accepted quirks while potion had no binding of its own to move to; once
+   it does, they stop being quirks and start being traps, so the streamlined
+   screen turns them off wholesale.  Reported as the port's whole purpose:
+   keep the game intact, modernise how you reach it. */
+let zonePotion = false;
 function controlRead(method, who, kb){
   let d = 0;
   const m = method & 3;
@@ -2439,8 +2469,9 @@ function controlRead(method, who, kb){
     if (kb.down(k[0])) d |= DIR_UP;      if (kb.down(k[1])) d |= DIR_DOWN;
     if (kb.down(k[2])) d |= DIR_LEFT;    if (kb.down(k[3])) d |= DIR_RIGHT;
     if (kb.down(k[4])) d |= DIR_FIRE;
+    if (zonePotion && k[5] && kb.down(k[5])) d |= DIR_POTION;  // ADDED -- see zonePotion
   }
-  if (kb.down(CTRL_MAGIC[who])) d |= DIR_POTION;    // $857E / $85A7
+  if (!zonePotion && kb.down(CTRL_MAGIC[who])) d |= DIR_POTION;  // $857E / $85A7, faithful
   return d;
 }
 
@@ -2780,11 +2811,14 @@ class FrontEnd {
     this.optChar = [this.cursor,
                      this.cursor === CHAR2_INDEX ? (CHAR2_INDEX + 1) & 3 : CHAR2_INDEX];
     this.optMethod = [3, 3];          // KEYBOARD, KEYBOARD -- GATE_CONFIG's own pair
-    this.optBinding = -1;             // -1 idle, else 0..4 = UI_DIRS index mid-capture
+    this.optBinding = -1;             // -1 idle, else 0..5 = UI_DIRS index mid-capture
     this.optBindPlayer = 0;
     this.optBindReady = false;
+    this.optBindMsg = '';             // why the last press was refused, for the footer
+    this.optBindMsgT = 0;             // frames left to show it
     this.optEdge = {};                // previous-frame nav state, for edge detection
     this.indepOut = false;            // see optFinish() / indepGamepads
+    this.zoneOut = false;             // see optFinish() / zonePotion
     this.enter(FAITHFUL_TAPE_PROMPTS ? 'stoptape' : 'loading');
   }
   /* ---- the screen helpers, all block A's own -------------------------- */
@@ -3176,77 +3210,71 @@ class FrontEnd {
     return v;
   }
   optToggleInput(p){
-    /* PLAYER 2 IS CONTROLLER-ONLY, not a free toggle -- see optFrame()'s own
-       comment on why.  Nothing to refuse here, there is simply nothing to
-       switch: PLAYERS itself is what gates whether a second player can
-       exist at all now (see its own optStep() arm below). */
-    if (p === 1) return;
     const want = this.optMethod[p] === 3 ? 1 : 3;      // KEYBOARD(3) <-> KEMPSTON(1)
     if (want === 1 && !this.canController(p)) return;  // no pad to give it -- refuse
     this.optMethod[p] = want;
   }
   optStep(r, d){
-    if (r.k === 'players'){
-      if (this.players === 1){
-        if (!this.canController(1)) return;    // no pad free for a CONTROLLER-only P2
-        this.players = 2; this.optMethod[1] = 1;
-      } else this.players = 1;
-      this.optSel = 0;
-      return;
-    }
+    if (r.k === 'players'){ this.players = this.players === 1 ? 2 : 1; this.optSel = 0; return; }
     if (r.k === 'char'){ this.optChar[r.p] = this.optOtherChar(r.p, d); return; }
     if (r.k === 'input'){ this.optToggleInput(r.p); return; }
     if (r.k === 'slow'){ loadSlowdown = !loadSlowdown; return; }
   }
   optActivate(r){
     if (r.k === 'rebind'){
-      this.optBinding = 0; this.optBindPlayer = r.p; this.optBindReady = false; return;
+      this.optBinding = 0; this.optBindPlayer = r.p; this.optBindReady = false;
+      this.optBindMsgT = 0; return;
     }
     if (r.k === 'reset'){ settingsReset(); return; }
     if (r.k === 'start'){ this.optFinish(); return; }
     this.optStep(r, 1);                 // players/char/input/slow: ENTER also advances
   }
-  /* Guided, five keys in order (UI_DIRS): whichever recognised Spectrum
-     key is next held becomes that direction's binding.  ENTER is the only
-     key still reserved -- it is this screen's own confirm (see FE_ENTER)
-     and SKIPS the direction instead of binding it, keeping the old key.
-     Reported requirement: EVERY key free, regardless of hard-coded origin.
-     Getting there took removing what each other reservation actually
-     protected, not just deleting the check:
-       SPACE   moved this screen's own confirm onto ENTER so SPACE could
-               stop being it (see FE_ENTER's own comment) -- freed first,
-               a screen ago.
-       CAPS    is CTRL_MAGIC's own player 1 MAGIC key, read unconditionally
-               regardless of method.  That was a genuine CROSS-PLAYER risk
-               as long as player 2 could also be on the shared keyboard --
-               player 2 binding their OWN key to CAPS would cast player 1's
-               magic on every press, a key neither player chose to share.
-               PLAYER 2 IS CONTROLLER-ONLY NOW (see optFrame()'s own
-               comment) precisely to close that: the only player who can
-               ever put CAPS in a KEYBOARD zone is player 1 himself, so the
-               remaining side effect -- his own bound key also casting his
-               own magic -- is the same kind of same-player redundancy
-               SPACE already carries for CTRL_MAGIC's OTHER half.
-       SYM     is $A84D's walk-through-walls cheat, global and unconditional
-               regardless of player -- freeing it while the cheat still
-               worked would have handed any keyboard player a free pass
-               through walls via their own bound key.  FAITHFUL_SYM_CHEAT
-               is off by default now (see its own comment) for exactly
-               this reason, so SYM carries no live side effect to inherit.
-     Because player 2 is CONTROLLER-only, REBIND KEYS can no longer even be
-     REACHED for player 2 (optRows() only ever offers it when a player is
-     on KEYBOARD) -- optBindPlayer is therefore always 0 in practice, and
-     the only collision left worth checking is a player's own five keys
-     against each other: binding DOWN to the same key UP already has would
-     make one press drive both directions at once, on ONE player, no other
-     zone involved any more.
+  /* Guided, six keys in order (UI_DIRS -- up, down, left, right, fire and
+     POTION, the sixth slot ADDED alongside zonePotion): whichever
+     recognised Spectrum key is next held becomes that slot's binding.
+     ENTER is the only reserved key -- it is this screen's own confirm (see
+     FE_ENTER) and SKIPS the slot instead of binding it, keeping the old
+     key.
+     Reported requirement, round two: EVERY key bindable, for BOTH players,
+     and never a refusal the player can't understand.  The first cut
+     refused any key found anywhere in either player's CURRENT zone, and
+     play found both ways that goes wrong:
+       * your OWN current keys blocked you -- UP could not take Q while Q
+         still sat in DOWN's slot, so the classic QAOP layout was
+         unreachable from the defaults in a single pass;
+       * the OTHER player's zone blocked you INVISIBLY -- zones persist in
+         localStorage (settingsSave) across sessions, the screen displays
+         them nowhere, so a key some past session left in player 2's zone
+         refused player 1 with no way to even discover why.  Reported from
+         play as "O and P aren't available for some reason", which is
+         exactly what it looked like from the chair.
+     So capture now distinguishes the two cases instead of lumping them:
+       * a key of YOUR OWN, sitting in another slot, SWAPS -- that slot
+         inherits this slot's old key, the zone stays six distinct keys at
+         every step, and nothing is ever refused: rearranging your own
+         keys is not a conflict.
+       * a key in the OTHER player's zone is the one TRUE conflict -- one
+         physical key cannot drive two players, because a shared keyboard
+         cannot say whose finger pressed it -- and it is refused WITH THE
+         REASON ON SCREEN (optBindMsg, drawn in the footer): capture stays
+         on the same slot and names the player who owns the key.  Still
+         checked regardless of that player's current method (he can switch
+         to KEYBOARD after the clash was saved), but never silently again.
+     The reservation history, for the record: SPACE was freed by moving
+     this screen's confirm onto ENTER (see FE_ENTER); SYM by turning the
+     $A84D walk-through-walls cheat off by default (FAITHFUL_SYM_CHEAT);
+     CAPS was briefly "freed with a quirk" -- its faithful magic read fired
+     alongside whatever it was bound to -- and that quirk is now gone too:
+     zonePotion gives potion a binding of its own and turns the
+     unconditional CAPS/SPACE reads off, so under this screen no key
+     carries a hidden second job at all.
      optBindReady tracks a FULL RELEASE, not any one key: it must wait for
      EVERY key to be up (kb.held empty) before it will scan again, both for
      the activating ENTER and, after a capture, for the key just captured --
      a first cut here gated only on ENTER, so a bind key held one frame too
      long (entirely plausible; the activating ENTER and the bind key are not
      the same key and have no reason to release together) was captured for
-     its own direction AND the next one. */
+     its own slot AND the next one. */
   optCaptureFrame(){
     const held = this.kb.held;
     if (!this.optBindReady){
@@ -3256,14 +3284,20 @@ class FrontEnd {
     if (held.size === 0) return;        // ready, but nothing pressed yet
     let got = null;
     for (const k of held){ got = k; break; }
-    const RESERVED = new Set(['ENTER']);
     const keys = CTRL_KEYS[3][this.optBindPlayer];
-    const claimed = keys && keys.some((k, i) => i !== this.optBinding && k === got);
-    if (!claimed){
-      if (!RESERVED.has(got) && keys) keys[this.optBinding] = got;
-      this.optBinding++;
-      if (this.optBinding >= 5){ this.optBinding = -1; settingsSave(); }
+    const other = CTRL_KEYS[3][1 - this.optBindPlayer];
+    if (got === 'ENTER'){                       // reserved: skip, keep the old key
+      this.optBinding++; this.optBindMsgT = 0;
+    } else if (other && other.includes(got)){   // the one true conflict
+      this.optBindMsg = 'PLAYER ' + (2 - this.optBindPlayer) + ' HAS THAT KEY';
+      this.optBindMsgT = 150;                   // ~3 seconds; stays on this slot
+    } else if (keys){
+      const j = keys.indexOf(got);              // ours already?  SWAP, never refuse
+      if (j >= 0 && j !== this.optBinding) keys[j] = keys[this.optBinding];
+      keys[this.optBinding] = got;
+      this.optBinding++; this.optBindMsgT = 0;
     }
+    if (this.optBinding >= UI_DIRS.length){ this.optBinding = -1; settingsSave(); }
     this.optBindReady = false;          // now wait for THIS key's release
   }
   optFinish(){
@@ -3275,34 +3309,40 @@ class FrontEnd {
        one player on KEYBOARD sharing method 1 with the other is the
        faithful shared-port case and indepGamepads must stay false for it. */
     this.indepOut = (this.optMethod[0] === 1 && this.optMethod[1] === 1);
+    /* a game configured through THIS screen always gets the per-player
+       potion wiring -- see zonePotion.  The faithful front end never sets
+       this, so its handover keeps the faithful CAPS/SPACE reads. */
+    this.zoneOut = true;
     settingsSave();
     this.enter('pressplay');
   }
   optFrame(){
-    /* A CONTROLLER CHOICE THAT NO LONGER HAS A PAD BEHIND IT is corrected
-       every frame this screen is up -- not just when the player touches
-       the row.  Two ways here have nothing to do with the player changing
-       their mind: settingsLoad() restores a PERSISTED choice with no pad
-       plugged in yet (a page reload, or simply that many browsers
-       withhold a gamepad from navigator.getGamepads() until one of its
-       buttons is pressed), and a pad can be unplugged mid-screen.  Either
-       way, reaching START with (IX+14)-style CONTROLLER set and nothing
-       feeding kempston/kempston2 would leave that player unable to move
-       for the whole game with no way back in -- the mid-game panel that
-       could once reconfigure this is gone.
-       P1 falls back to KEYBOARD, same as always.  P2 has no such fallback
-       any more: REBIND KEYS is now the ONLY way to reach an unclaimed key
-       on the one shared keyboard (see optCaptureFrame's RESERVED set,
-       down to just this screen's own ENTER), and that only stays true if
-       P2 never has a live zone on it to claim one FROM -- so a P2 who
-       loses his pad drops PLAYERS back to 1 outright, not onto the
-       keyboard, which is exactly the combination reported as wanted:
-       KEYBOARD+CONTROLLER or CONTROLLER+CONTROLLER, never two keyboards. */
-    if (this.optMethod[0] === 1 && !this.canController(0)) this.optMethod[0] = 3;
-    if (this.players === 2){
-      if (this.canController(1)) this.optMethod[1] = 1;
-      else this.players = 1;
-    }
+    /* A CONTROLLER CHOICE THAT NO LONGER HAS A PAD BEHIND IT is downgraded
+       back to KEYBOARD, every frame this screen is up -- not just when the
+       player touches the row.  Two ways here have nothing to do with the
+       player changing their mind: settingsLoad() restores a PERSISTED
+       choice with no pad plugged in yet (a page reload, or simply that
+       many browsers withhold a gamepad from navigator.getGamepads() until
+       one of its buttons is pressed), and a pad can be unplugged mid-
+       screen.  Either way, reaching START with (IX+14)-style CONTROLLER
+       set and nothing feeding kempston/kempston2 would leave that player
+       unable to move for the whole game with no way back in -- the
+       mid-game panel that could once reconfigure this is gone.
+       Symmetric for BOTH players on purpose: an earlier version of this
+       screen made player 2 controller-only, reasoning that CAPS (his
+       binding it would cast PLAYER 1's magic) needed that to be safe.
+       That reasoning didn't hold up -- it's the exact mirror of SPACE
+       binding into player 1's zone casting PLAYER 2's magic, which this
+       screen already accepts as a documented quirk (see optCaptureFrame's
+       own comment) -- and being controller-only left player 2 with no
+       valid method at all whenever player 1 took the only pad, or when no
+       pad existed and player 1 stayed on the keyboard.  Two keyboard
+       players sharing the one keyboard through their own disjoint zones
+       is exactly what the original hardware already supports; the real
+       safety net is the rebind-collision check against an ACTUAL
+       duplicate key, not a method restriction. */
+    for (const p of [0, 1])
+      if (this.optMethod[p] === 1 && !this.canController(p)) this.optMethod[p] = 3;
     /* pad 0 only, for MENU navigation -- no player has a controller
        assigned yet, so there is no "which pad is player 2's" to ask. */
     const padv = (padStatus.bits && padStatus.bits[0]) || 0;
@@ -3316,6 +3356,7 @@ class FrontEnd {
     const pressed = k => now[k] && !this.optEdge[k];
     if (this.optBinding >= 0){
       this.optCaptureFrame();
+      if (this.optBindMsgT > 0) this.optBindMsgT--;   // the refusal reason fades
       this.optEdge = now;
       return;
     }
@@ -3450,8 +3491,15 @@ class FrontEnd {
       }
     });
 
-    const foot = (this.optBinding >= 0) ? 'ENTER  CAPS  SYM  TO SKIP'   // no '/' -- see UI_ARROW
-                                        : 'ARROWS MOVE   ENTER CONFIRM';
+    /* mid-capture the footer is the guidance line -- or, for a few
+       seconds after a refused key, the REASON it was refused, which is
+       the whole point of optBindMsg: a refusal you can't see is a key
+       that just "isn't available for some reason".  (The old capture
+       footer still read 'ENTER CAPS SYM TO SKIP' -- stale twice over,
+       CAPS and SYM have been bindable since their reservations fell.) */
+    const foot = (this.optBinding >= 0)
+      ? (this.optBindMsgT > 0 ? this.optBindMsg : 'ENTER TO SKIP')
+      : 'ARROWS MOVE   ENTER CONFIRM';
     uiText(ctx, foot, col + ((W - foot.length) >> 1), row + H - 2, UI_ATTR);
   }
 }
@@ -3819,6 +3867,11 @@ class Game{
        "CONTROLLER + CONTROLLER" choice.  false is the faithful default and
        what every gate and headless check runs with. */
     indepGamepads = !!cfg.indepGamepads;
+    /* ADDED (see zonePotion at controlRead): per-player potion wiring, set
+       only by the streamlined screen's handover.  false is the faithful
+       default -- $857E/$85A7's unconditional CAPS/SPACE -- and what every
+       gate and headless check outside zonePotion's own tests runs with. */
+    zonePotion = !!cfg.zonePotion;
     /* ---- THE TAPE AND THE LEVEL COUNTER -----------------------------
        $8403 the dungeon number, $84CC the pack mask, $84CD the flag the
        next load asks for, $84BA the treasure countdown, $84C7 the mirror
@@ -10130,7 +10183,8 @@ function feHandover(){
   game.reset({char: frontend.FFFF, char2: frontend.FFFE,
               method1: frontend.FFFC, method2: frontend.FFFB,
               buildSeed: freshBuildSeed(),
-              indepGamepads: frontend.indepOut});
+              indepGamepads: frontend.indepOut,
+              zonePotion: frontend.zoneOut});
   game.enterAttract();
   feRunning = false;
 }
@@ -10196,13 +10250,21 @@ function settingsLoad(){
       v.char.every(n => typeof n === 'number') && v.char[0] !== v.char[1])
     frontend.optChar = [v.char[0] & 3, v.char[1] & 3];
   /* restore key lists SHAPE-CHECKED -- a stored blob from an older build must
-     not be able to hand controlRead an undefined key name. */
+     not be able to hand controlRead an undefined key name.  Length 5 OR 6:
+     saves from before the POTION slot existed carry five keys per zone, and
+     restoring those five over a six-wide in-memory zone leaves slot 5 at
+     its default (CAPS / N) -- the migration is that there is no migration.
+     The j-bound guards the other direction too: a six-wide blob must not
+     EXTEND a method row that is faithfully five keys wide. */
   if (Array.isArray(v.keys) && v.keys.length === CTRL_KEYS.length)
     v.keys.forEach((m, i) => {
       if (!Array.isArray(m)) return;
       m.forEach((k, w) => {
-        if (Array.isArray(k) && k.length === 5 && CTRL_KEYS[i][w])
-          k.forEach((n, j) => { if (typeof n === 'string') CTRL_KEYS[i][w][j] = n; });
+        if (Array.isArray(k) && (k.length === 5 || k.length === 6) && CTRL_KEYS[i][w])
+          k.forEach((n, j) => {
+            if (typeof n === 'string' && j < CTRL_KEYS[i][w].length)
+              CTRL_KEYS[i][w][j] = n;
+          });
       });
     });
 }
@@ -10213,7 +10275,7 @@ function settingsReset(){
   settingsSave();
 }
 
-const UI_DIRS = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'FIRE'];
+const UI_DIRS = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'FIRE', 'POTION'];
 const UI_ATTR = 0x47;                // $8A28's own border ink, on a BLACK field
 
 /* ---- THE JOYSTICK(S).  controlRead's KEMPSTON arm already reads kb.kempston
