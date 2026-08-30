@@ -1,0 +1,15 @@
+# tape material is not distributed -- see tape/original_tapes_not_supplied.txt
+Gauntlet.tzx.zip
+# Z80 machine states captured from the tape image; same class as the tape
+*.pkl
+# scratch / unrelated local artifacts
+shot.ppm
+game.html
+TZX_Format.html
+TZX_Format_files/
+__pycache__/
+# build/ carries only the JSON assets the build inlines and the fixtures the
+# tests read; everything else there is local probe output (raw .bin memory
+# dumps are tape-derived and stay out on the same grounds as the .pkl files)
+build/*
+!build/*.json
