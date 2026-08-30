@@ -8008,5 +8008,59 @@ if (process.argv[2] === '--table') {
   }
 }
 
+/* ====================================================================
+   THE BRIDGE'S ADAPTIVE LEAD -- ADDED, see SoundOut's own comment.
+   Reported from play on an Acer Nitro 5: "the sound is really choppy".
+   The fixed 80 ms head start was the whole jitter budget, and a machine
+   whose main thread stalls longer than that tears the schedule on every
+   stall.  Driven here with a mock AudioContext whose clock the test owns,
+   through the REAL flushBeeper and the REAL BeeperChip.
+   ==================================================================== */
+{
+  const FRAME_HZ = G.constants.FRAME_HZ;
+  const S = new G.sound.SoundOut();
+  S.ctx = {
+    _t: 0, get currentTime(){ return this._t; }, sampleRate: 44100,
+    createBuffer(ch, len, sr){ const d = new Float32Array(len);
+      return { getChannelData: () => d }; },
+    createBufferSource(){ return { buffer: null, connect(){}, start(){} }; },
+  };
+  S.gain = { connect(){} };
+  S.chip = new G.sound.BeeperChip(44100);
+
+  S.ctx._t = 0;
+  S.flushBeeper([], 10);                       // first flush: originate the map
+  check('the first flush originates at now + the DEFAULT lead',
+        [S.lead, S.t0], [0.08, 0.08]);
+
+  S.ctx._t = 0.02;
+  S.flushBeeper([[12, 1]], 15);                // healthy progress
+  checkTrue('a healthy flush schedules and never ratchets',
+            S.live.length === 1 && S.underruns === 0 && S.lead === 0.08);
+
+  /* a 120 ms main-thread stall: the cursor (t0 + 5 frames) is now BEHIND
+     the clock.  The ratchet must cover the measured deficit plus the base
+     margin -- not jump straight to the ceiling. */
+  const cursor = 0.08 + 5/FRAME_HZ;
+  S.ctx._t = 0.30;
+  S.flushBeeper([], 20);
+  const expect = (0.30 - cursor) + 0.08;
+  checkTrue('an underrun ratchets the lead by the MEASURED deficit + margin',
+            S.underruns === 1 && Math.abs(S.lead - expect) < 1e-9,
+            'lead ' + S.lead.toFixed(5) + ' expect ' + expect.toFixed(5));
+  checkTrue('...and the re-origin schedules with the NEW lead',
+            Math.abs(S.t0 - (0.30 + expect)) < 1e-9);
+
+  S.ctx._t = 5;                                // a pathological stall
+  S.flushBeeper([], 25);
+  checkTrue('a huge stall caps the lead at SND_LEAD_MAX',
+            S.underruns === 2 && S.lead === 0.24);
+
+  const led = S.lead, und = S.underruns, rs = S.resyncs;
+  S.flushBeeper([], 2);                        // upto < next: a game RESTART
+  checkTrue('a clock restart re-origins but does NOT ratchet -- it is not a tear',
+            S.resyncs === rs + 1 && S.underruns === und && S.lead === led);
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);
