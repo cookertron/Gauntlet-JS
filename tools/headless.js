@@ -8060,6 +8060,24 @@ if (process.argv[2] === '--table') {
   S.flushBeeper([], 2);                        // upto < next: a game RESTART
   checkTrue('a clock restart re-origins but does NOT ratchet -- it is not a tear',
             S.resyncs === rs + 1 && S.underruns === und && S.lead === led);
+
+  /* start() asks the OS for the STABILITY buffer, not the smallest one --
+     'playback', not the default 'interactive'.  See SoundOut.start()'s own
+     comment: the game's sound is pass-quantised to 80-100 ms anyway, and
+     the small-buffer default is what crackles on a DPC-spiky laptop. */
+  {
+    let captured = null;
+    sandbox.AudioContext = class {
+      constructor(opts){ captured = opts; this.sampleRate = 48000;
+        this.destination = {}; }
+      createGain(){ return { gain: { value: 0 }, connect(){} }; }
+    };
+    const S2 = new G.sound.SoundOut();
+    checkTrue('start() brings the context up under the mock', S2.start() === true);
+    checkTrue('...and asks for the playback latency class, not the default',
+              !!captured && captured.latencyHint === 'playback');
+    delete sandbox.AudioContext;
+  }
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
