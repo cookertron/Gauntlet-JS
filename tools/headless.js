@@ -8124,7 +8124,118 @@ if (process.argv[2] === '--table') {
     checkTrue('start() brings the context up under the mock', S2.start() === true);
     checkTrue('...and asks for the playback latency class, not the default',
               !!captured && captured.latencyHint === 'playback');
+    checkTrue('...and with no audioWorklet on the context, stays on the scheduler',
+              S2.mode === 'sched' && S2.initPending === false);
     delete sandbox.AudioContext;
+  }
+}
+
+/* ====================================================================
+   THE WORKLET PATH -- ADDED, see WORKLET_SRC's own comment.  One
+   continuous pull-model stream, the architecture a native emulator uses,
+   because a machine was found (an Acer Nitro 5) that crackles on the
+   scheduled-buffer joins while playing an emulator's stream clean.
+   ==================================================================== */
+{
+  const FRAME_HZ = G.constants.FRAME_HZ, sr = 44100;
+
+  /* --- the tiling: the FIFO concatenation reconstructs ONE continuous
+     render exactly, over irregular flush steps -- the same property the
+     scheduled path proves against ctx time, restated against the stream
+     clock. */
+  {
+    const S = new G.sound.SoundOut();
+    const chunks = [];
+    S.ctx = { sampleRate: sr };
+    S.chip = new G.sound.BeeperChip(sr);
+    S.node = { port: { postMessage(m){ if (m.chunk) chunks.push(m.chunk); } } };
+    S.mode = 'worklet';
+    const edges = [];                    // a 0.37-frame square over 60 frames
+    { let lv = 1; for (let f = 0.2; f < 60; f += 0.37){ edges.push([f, lv]); lv ^= 1; } }
+    const log = [];
+    let fed = 0;
+    const feed = (upto) => {
+      while (fed < edges.length && edges[fed][0] < upto) log.push(edges[fed++]);
+      S.flushWorklet(log, upto);
+    };
+    S.flushWorklet([], 0);               // originate the stream at frame 0
+    for (const u of [3, 8, 9, 15, 26, 41, 60]) feed(u);
+    const total = Math.floor(60/FRAME_HZ*sr);
+    check('the stream sent exactly the whole-sample window of 60 frames',
+          S.vsent, total);
+    const cat = new Float32Array(total);
+    { let o = 0; for (const c of chunks){ cat.set(c, o); o += c.length; } }
+    const ref = new Float32Array(total);
+    new G.sound.BeeperChip(sr).render(ref, 0, total, 0,
+      edges.map(e => [e[0]/FRAME_HZ, e[1]]), 0);
+    let worst = 0;
+    for (let i = 0; i < total; i++) worst = Math.max(worst, Math.abs(cat[i] - ref[i]));
+    checkTrue('the chunk concatenation IS the one-shot render, sample for sample',
+              worst < 1e-7, 'worst ' + worst.toExponential(2));
+
+    /* a sim-clock restart re-origins the map with NO chunk and NO gap */
+    const rs = S.resyncs, n0 = chunks.length;
+    S.flushWorklet([[1, 1]], 2);         // upto 2 < next 60
+    checkTrue('a clock restart re-origins the stream map without emitting',
+              S.resyncs === rs + 1 && chunks.length === n0 &&
+              S.vbase === 2 && S.vsent === 0 && S.chip.lvl === 1);
+  }
+
+  /* --- the sample-fed ratchet: an underrun report ratchets the lead by
+     the episode's own length and hands the worklet its new refill gate. */
+  {
+    const S = new G.sound.SoundOut();
+    const posted = [];
+    S.ctx = { sampleRate: sr };
+    S.node = { port: { postMessage(m){ posted.push(m); } } };
+    S.ratchetSamples(Math.round(0.05*sr));
+    checkTrue('an underrun report ratchets lead to episode + margin',
+              S.underruns === 1 && Math.abs(S.lead - 0.13) < 1e-3);
+    checkTrue('...and posts the worklet its new refill gate',
+              posted.length === 1 &&
+              posted[0].min === Math.floor(S.lead*sr));
+    S.ratchetSamples(sr * 2);
+    checkTrue('...and a huge episode caps at SND_LEAD_MAX', S.lead === 0.24);
+  }
+
+  /* --- the processor itself, eval'd from the SAME source string the page
+     ships, with the worklet globals stubbed. */
+  {
+    let ProcCls = null; const reports = [];
+    const AudioWorkletProcessor = class {
+      constructor(){ this.port = { onmessage: null,
+                                   postMessage: m => reports.push(m) }; } };
+    const registerProcessor = (name, cls) => { ProcCls = cls; };
+    void AudioWorkletProcessor; void registerProcessor;
+    eval(G.sound.WORKLET_SRC);
+    const p = new ProcCls();
+    const msg = d => p.port.onmessage({ data: d });
+    const spin = () => { const o = new Float32Array(128);
+                         p.process([], [[o]]); return o; };
+    msg({ min: 100 });
+    let o = spin();
+    checkTrue('before anything arrives: silence, and NO underrun report',
+              reports.length === 0 && o.every(v => v === 0));
+    msg({ chunk: new Float32Array(60).fill(0.5) });     // below the gate
+    o = spin();
+    checkTrue('below the refill gate the stream does not start yet',
+              reports.length === 0 && o.every(v => v === 0));
+    msg({ chunk: new Float32Array(80).fill(0.25) });    // depth 140 >= 100
+    o = spin();
+    checkTrue('at the gate it starts -- and boot silence was NOT an underrun',
+              reports.length === 0 && o[0] === 0.5 && o[127] === 0.25);
+    o = spin();                                         // 12 left, then dry
+    checkTrue('a dry queue emits zeros mid-episode without reporting yet',
+              reports.length === 0 && o[11] === 0.25 && o[12] === 0);
+    msg({ chunk: new Float32Array(50).fill(0.75) });    // below the gate
+    o = spin();
+    checkTrue('recovery ALSO waits for the refill gate -- no fragile resume',
+              reports.length === 0 && o.every(v => v === 0));
+    msg({ chunk: new Float32Array(80).fill(0.75) });    // depth 130 >= 100
+    o = spin();
+    checkTrue('resuming reports the episode length, once',
+              reports.length === 1 && reports[0].underrun === 244 &&
+              o[0] === 0.75);
   }
 }
 
