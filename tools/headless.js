@@ -3349,6 +3349,11 @@ if (A.player_frames) {
        edge stream for a known (C,E), render it, and count ZERO CROSSINGS out
        of the samples -- never a read-back of beepHz(). */
     {
+      /* everything in this block measures the BOX INTEGRAL and the DC
+         BLOCKER, so it runs with the ADDED speaker model off -- the 1,588 Hz
+         at-unity bound in particular is a property of the blocker's
+         passband, which the 4.2 kHz speaker roll-off deliberately shades. */
+      G.speakerFilter.set(false);
       const sr = 44100;
       const measure = (e) => {
         const half = S.beepHalf(e) / 3500000;         // seconds
@@ -3443,6 +3448,49 @@ if (A.player_frames) {
         checkTrue('the startup transient decays as h*R^i, not as a whine',
                   worst < 0, String(worst));
       }
+      G.speakerFilter.set(true);
+    }
+
+    /* 8. THE SPEAKER MODEL -- ADDED, see SPEAKER_FILTER's own comment: the
+       raw square is the VOLTAGE; what a Spectrum owner heard came through a
+       ~4 cm cone that rolled the top octaves off, and small modern drivers
+       buzz on the unfiltered edges (reported from play as "very crackly").
+       A 2nd-order low pass at 4.2 kHz, live-toggleable. */
+    {
+      const sr = 44100;
+      const square = (hz, secs) => {
+        const ed = []; let lv = 1;
+        for (let t = 0; t < secs; t += 1/(2*hz)){ ed.push([t, lv]); lv ^= 1; }
+        return ed;
+      };
+      const rms = (b, from) => {
+        let s = 0; for (let i = from; i < b.length; i++) s += b[i]*b[i];
+        return Math.sqrt(s / (b.length - from));
+      };
+      const render = (hz) => {
+        const n = Math.round(sr * 0.2), b = new Float32Array(n);
+        new S.BeeperChip(sr).render(b, 0, n, 0, square(hz, 0.2), 0);
+        return rms(b, Math.round(sr * 0.1));      // past the DC settle
+      };
+      G.speakerFilter.set(false); const hiRaw = render(8000), loRaw = render(500);
+      G.speakerFilter.set(true);  const hiMod = render(8000), loMod = render(500);
+      checkTrue('the speaker model shades an 8 kHz square well below the raw render',
+                hiMod < hiRaw * 0.5, (hiMod/hiRaw).toFixed(3) + ' of raw');
+      checkTrue('...and passes a 500 Hz square nearly whole',
+                loMod > loRaw * 0.85, (loMod/loRaw).toFixed(3) + ' of raw');
+      /* the filter STATE persists across render() calls -- a buffer join in
+         the bridge lands mid-waveform, and a per-call reset would click on
+         every one of them.  Split render must equal whole render EXACTLY. */
+      const n = Math.round(sr * 0.1), ed = square(2000, 0.1);
+      const whole = new Float32Array(n), split = new Float32Array(n);
+      new S.BeeperChip(sr).render(whole, 0, n, 0, ed, 0);
+      const c2 = new S.BeeperChip(sr), h = n >> 1;
+      const ei = c2.render(split, 0, h, 0, ed, 0);
+      c2.render(split, h, n - h, h/sr, ed, ei);
+      let same = true;
+      for (let i = 0; i < n; i++) if (whole[i] !== split[i]){ same = false; break; }
+      checkTrue('the model state carries across render calls: split === whole',
+                same);
     }
   }
 

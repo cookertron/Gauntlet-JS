@@ -1958,6 +1958,22 @@ class AyChip{
    The PASS CLOCK is a separate question and does model contention now --
    see the CLK block -- but the beeper's own loops live above $8000, where
    there is nothing to contend, so this stays true either way.            */
+/* ADDED, not ported: THE SPEAKER, as distinct from the VOLTAGE.  The chip
+   below reproduces bit 4 of $FE exactly -- a mathematically perfect square
+   wave -- but nobody ever HEARD that: the real machine played it through a
+   ~4 cm cone in a plastic case, which mechanically low-passed everything.
+   Rendering the raw square into modern hardware is arguably LESS faithful
+   to the experience, and it is measurably harsher: the edges carry
+   fold-back aliasing, and small laptop drivers buzz and break up on
+   full-bandwidth squares (reported from play on an Acer Nitro 5 as
+   "very crackly", surviving every scheduling and buffering fix, because
+   the crackle was in the waveform's own top octaves).  True runs the
+   render through a 2nd-order low-pass at 4.2 kHz -- the same class of
+   speaker model mature Spectrum emulators apply -- and false is the raw
+   voltage, live-toggleable (__GAUNTLET__.speakerFilter) so the two can be
+   A/B'd mid-game.  The dc=false exactness path and every edge-stream gate
+   are upstream of this and unaffected either way. */
+let SPEAKER_FILTER = true;
 class BeeperChip{
   constructor(sampleRate, dc){
     this.sr = sampleRate; this.lvl = 0;
@@ -1975,6 +1991,15 @@ class BeeperChip{
     this.dc = dc !== false;
     this.R = 1 - 2*Math.PI*20/sampleRate;
     this.px = 0; this.py = 0;
+    /* the SPEAKER MODEL's biquad (RBJ low-pass, fc 4.2 kHz, Q 0.7071),
+       transposed direct form II; state persists across render() calls the
+       same way px/py do, so buffer joins stay continuous.  The state is
+       fed even when SPEAKER_FILTER is off, so a live toggle never thumps. */
+    const w0 = 2*Math.PI*4200/sampleRate, cw = Math.cos(w0),
+          al = Math.sin(w0)/(2*0.7071), a0 = 1 + al;
+    this.fb0 = ((1-cw)/2)/a0; this.fb1 = (1-cw)/a0; this.fb2 = this.fb0;
+    this.fa1 = (-2*cw)/a0;    this.fa2 = (1-al)/a0;
+    this.z1 = 0; this.z2 = 0;
   }
   /* `edges` is a sorted list of [timeSeconds, level] relative to `t0`; every
      one strictly inside [t0, t0 + n/sr) is consumed.  Returns the index of
@@ -1994,7 +2019,10 @@ class BeeperChip{
       if (!this.dc){ buf[off+i] = v - 0.5; continue; }
       const y = v - this.px + this.R*this.py;
       this.px = v; this.py = y;
-      buf[off+i] = y;
+      const s = this.fb0*y + this.z1;             // the speaker model
+      this.z1 = this.fb1*y - this.fa1*s + this.z2;
+      this.z2 = this.fb2*y - this.fa2*s;
+      buf[off+i] = SPEAKER_FILTER ? s : y;
     }
     return ei;
   }
@@ -10637,6 +10665,13 @@ globalThis.__GAUNTLET__={
   symCheat:{
     get(){ return FAITHFUL_SYM_CHEAT; },
     set(v){ FAITHFUL_SYM_CHEAT = !!v; return FAITHFUL_SYM_CHEAT; },
+  },
+  /* the beeper's speaker model (see SPEAKER_FILTER) -- live-toggleable so
+     the modelled and raw-voltage renders can be A/B'd mid-game from the
+     console: __GAUNTLET__.speakerFilter.set(false) */
+  speakerFilter:{
+    get(){ return SPEAKER_FILTER; },
+    set(v){ SPEAKER_FILTER = !!v; return SPEAKER_FILTER; },
   },
   frontend:{FrontEnd, Keyboard, SpecScreen, TitleTune, FE, live:frontend,
             renderScreen, feHandover, pollGamepads, liveKb:keyboard,
