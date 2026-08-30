@@ -2127,6 +2127,7 @@ class SoundOut{
        the few ms the decision takes, so the first buffers take whichever
        path actually won. */
     this.mode = 'sched'; this.node = null; this.initPending = false;
+    this.workletErr = '';      // why the worklet did not engage, for info()
     this.vbase = 0;           // sim frame at the stream's origin
     this.vsent = 0;           // samples pushed since that origin
   }
@@ -2154,7 +2155,9 @@ class SoundOut{
            ' lead=' + this.lead.toFixed(3) + ' underruns=' + this.underruns +
            ' resyncs=' + this.resyncs + ' dropped=' + this.dropped +
            ' base=' + (c.baseLatency != null ? c.baseLatency.toFixed(4) : '?') +
-           ' out=' + (c.outputLatency != null ? c.outputLatency.toFixed(4) : '?');
+           ' out=' + (c.outputLatency != null ? c.outputLatency.toFixed(4) : '?') +
+           ' wk=' + (this.mode === 'worklet' ? 'on'
+                     : (this.workletErr ? this.workletErr.trim() : 'off'));
   }
   /* a browser will not start a context before a user gesture, so this is
      called from the first keydown rather than from load */
@@ -2197,15 +2200,23 @@ class SoundOut{
        is async, so flush() waits on initPending for the few ms the answer
        takes; a browser without worklets (or a failed module load) simply
        stays on the scheduled path.  Beeper mode only: the AY path keeps
-       the scheduler, declared. */
+       the scheduler, declared.
+       TWO module URLS, in order, because the obvious one fails exactly
+       where this page lives: Chrome refuses a BLOB module for a worklet on
+       a file:// page (AbortError, 'Unable to load a worklet's module' --
+       MEASURED with a probe page in headless Chrome, which also proved the
+       data: form loads, constructs and talks), and file:// is how a
+       download-and-double-click player runs this game.  blob: is tried
+       first for the http(s) world, data: is the file:// fallback, and a
+       failure of both leaves the reason in workletErr where info() can
+       show it -- the first failure here was SILENT and cost a whole
+       remote-debugging round trip to see. */
     if (SOUND_MODE === SOUND_48K && this.ctx.audioWorklet &&
         typeof AudioWorkletNode !== 'undefined' &&
         typeof Blob !== 'undefined' && typeof URL !== 'undefined' &&
         URL.createObjectURL){
       this.initPending = true;
-      const url = URL.createObjectURL(
-        new Blob([WORKLET_SRC], { type: 'application/javascript' }));
-      this.ctx.audioWorklet.addModule(url).then(() => {
+      const wire = () => {
         this.node = new AudioWorkletNode(this.ctx, 'gauntlet-beeper',
           { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
         this.node.connect(this.gain);
@@ -2215,7 +2226,23 @@ class SoundOut{
         this.node.port.postMessage(
           { min: Math.floor(this.lead * this.ctx.sampleRate) });
         this.mode = 'worklet'; this.initPending = false;
-      }).catch(() => { this.initPending = false; });
+      };
+      /* only addModule's own then(onOk, onErr) -- no interior Promises, so
+         the chain is drivable synchronously by a thenable in tests */
+      const attempt = (url, tag, next) => {
+        this.ctx.audioWorklet.addModule(url).then(wire, (e) => {
+          this.workletErr += tag + ':' + ((e && e.name) || e) + ' ';
+          if (next) next(); else this.initPending = false;
+        });
+      };
+      const blobUrl = URL.createObjectURL(
+        new Blob([WORKLET_SRC], { type: 'application/javascript' }));
+      attempt(blobUrl, 'blob', () => {
+        if (typeof btoa !== 'undefined')
+          attempt('data:application/javascript;base64,' + btoa(WORKLET_SRC),
+                  'data', null);
+        else this.initPending = false;
+      });
     }
     return true;                       // the context has JUST come up
   }

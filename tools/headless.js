@@ -8128,6 +8128,58 @@ if (process.argv[2] === '--table') {
               S2.mode === 'sched' && S2.initPending === false);
     delete sandbox.AudioContext;
   }
+
+  /* --- the worklet module's TWO URLs, blob then data ---------------------
+     MEASURED in headless Chrome: a blob module for a worklet FAILS on a
+     file:// page (AbortError) while the data: form loads and constructs --
+     and file:// is how a double-clicked download runs this game.  The
+     mocks' addModule returns a SYNCHRONOUS thenable, which the engine's
+     chain supports on purpose (only addModule's own then(onOk, onErr), no
+     interior Promises), so the whole async dance is assertable inline. */
+  {
+    const mkCtx = (verdict) => class {
+      constructor(){ this.sampleRate = 48000; this.destination = {};
+        this.tried = []; const tried = this.tried;
+        this.audioWorklet = { addModule: (url) => ({
+          then(ok, err){ tried.push(url.slice(0, 5));
+                         verdict(url) ? ok() : err({ name: 'AbortError' }); }
+        }) };
+      }
+      createGain(){ return { gain: { value: 0 }, connect(){} }; }
+    };
+    sandbox.Blob = Blob; sandbox.URL = URL; sandbox.btoa = btoa;
+    sandbox.AudioWorkletNode = class {
+      constructor(ctx, name, opts){ this.name = name; this.opts = opts;
+        this.port = { posted: [], onmessage: null,
+                      postMessage(m){ this.posted.push(m); } }; }
+      connect(){}
+    };
+
+    sandbox.AudioContext = mkCtx(url => !url.startsWith('blob:'));
+    const S3 = new G.sound.SoundOut();
+    S3.start();
+    checkTrue('a blob-refusing platform (file://) falls back to the data: module',
+              S3.mode === 'worklet' && S3.initPending === false &&
+              S3.ctx.tried.length === 2 && S3.ctx.tried[0] === 'blob:' &&
+              S3.ctx.tried[1] === 'data:');
+    checkTrue('...recording WHY blob was refused for info()',
+              S3.workletErr.indexOf('blob:AbortError') === 0 &&
+              S3.info().indexOf('wk=on') > 0);
+    checkTrue('...and the node got its refill gate on arrival',
+              S3.node.port.posted.length === 1 &&
+              S3.node.port.posted[0].min === Math.floor(0.08 * 48000));
+
+    sandbox.AudioContext = mkCtx(() => false);       // nothing loads
+    const S4 = new G.sound.SoundOut();
+    S4.start();
+    checkTrue('both URLs refused: the scheduler keeps the game audible',
+              S4.mode === 'sched' && S4.initPending === false);
+    checkTrue('...and info() names both failures instead of staying silent',
+              S4.info().indexOf('wk=blob:AbortError data:AbortError') > 0);
+
+    delete sandbox.AudioContext; delete sandbox.AudioWorkletNode;
+    delete sandbox.Blob; delete sandbox.URL; delete sandbox.btoa;
+  }
 }
 
 /* ====================================================================
