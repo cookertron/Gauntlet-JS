@@ -2458,6 +2458,20 @@ let FAITHFUL_SYM_CHEAT = false;
    screen turns them off wholesale.  Reported as the port's whole purpose:
    keep the game intact, modernise how you reach it. */
 let zonePotion = false;
+/* ADDED, not ported: whether an out-of-game player 2 can be CLAIMED by a
+   device his configured method byte does not name -- see the claim block
+   in readKeys().  In the original, a player whose method is KEYBOARD can
+   only ever join on his keyboard fire key; a pad's fire does nothing for
+   him ($944C tests the dir his METHOD produced, and nothing else).  With
+   one player started from the streamlined screen that is exactly the
+   reported dead end: player 2's method byte still says KEYBOARD, so the
+   controller in his hands is mute.  False -- the default, and what every
+   gate and headless check outside its own tests runs with -- keeps the
+   faithful gate.  True -- set only by the streamlined handover, the same
+   wire indepGamepads and zonePotion ride -- lets FIRE on the free pad (or
+   the keyboard zone, both directions) claim him and assign his method in
+   the same breath. */
+let deviceJoin = false;
 function controlRead(method, who, kb){
   let d = 0;
   const m = method & 3;
@@ -2820,6 +2834,8 @@ class FrontEnd {
     this.optEdge = {};                // previous-frame nav state, for edge detection
     this.indepOut = false;            // see optFinish() / indepGamepads
     this.zoneOut = false;             // see optFinish() / zonePotion
+    this.deviceOut = false;           // see optFinish() / deviceJoin
+    this.playersOut = 0;              // see optFinish() / Game.autoJoin
     this.enter(FAITHFUL_TAPE_PROMPTS ? 'stoptape' : 'loading');
   }
   /* ---- the screen helpers, all block A's own -------------------------- */
@@ -3314,6 +3330,17 @@ class FrontEnd {
        potion wiring -- see zonePotion.  The faithful front end never sets
        this, so its handover keeps the faithful CAPS/SPACE reads. */
     this.zoneOut = true;
+    /* a game configured through THIS screen also gets device-claims for
+       player 2's join -- see deviceJoin.  Same reasoning as zonePotion:
+       the modern input model is a package. */
+    this.deviceOut = true;
+    /* START MEANS START -- how many players the handover should join
+       outright (see Game.autoJoin).  This screen ends on a button that
+       says START GAME with the players already named; landing on the
+       ranked table to press FIRE would be asking for a decision the
+       player has just made.  The faithful front end never sets this, so
+       its handover keeps $B374's flow: attract until FIRE. */
+    this.playersOut = this.players;
     settingsSave();
     this.enter('pressplay');
   }
@@ -3873,6 +3900,9 @@ class Game{
        default -- $857E/$85A7's unconditional CAPS/SPACE -- and what every
        gate and headless check outside zonePotion's own tests runs with. */
     zonePotion = !!cfg.zonePotion;
+    /* ADDED (see deviceJoin at controlRead): device-claims for player 2's
+       join, same wire, same faithful-false default. */
+    deviceJoin = !!cfg.deviceJoin;
     /* ---- THE TAPE AND THE LEVEL COUNTER -----------------------------
        $8403 the dungeon number, $84CC the pack mask, $84CD the flag the
        next load asks for, $84BA the treasure countdown, $84C7 the mirror
@@ -4573,6 +4603,33 @@ class Game{
     this.symHeld = FAITHFUL_SYM_CHEAT &&
       ((input && input.kb) ? input.kb.down('SYM') : !!(input && input.sym));
     if (input && input.kb){                          // $855D, for real
+      /* ADDED -- see deviceJoin: an OUT-of-game player 2 is CLAIMED by
+         whichever device presses FIRE, by reassigning his method RIGHT
+         HERE, one line before his dir is read -- so the very same pass's
+         controlRead sees the fire and the untouched join ($9440..$948C,
+         via joinPass immediately after readKeys) brings him in.  The pad
+         that can claim him is the one player 1 is NOT using: pad 0
+         (kempston) when player 1 is on the keyboard -- the faithful
+         shared-port shape, indepGamepads false -- or pad 1 (kempston2)
+         when player 1 holds pad 0, which is the independent-pads shape.
+         Player 1's OWN fire can therefore never join player 2.  The claim
+         runs BOTH ways: a pad-claimed (or persisted-CONTROLLER) player 2
+         who is out of the game can be claimed back by his keyboard
+         zone's own FIRE key.  Reported from play: with one player
+         started, "pressing buttons on the controller does nothing" --
+         player 2's method byte still said KEYBOARD, so the join gate
+         never looked at the pad. */
+      if (deviceJoin && !this.players[1].inGame){
+        const pad = ((this.method1 & 3) === CTRL_KEMPSTON) ? input.kb.kempston2
+                                                           : input.kb.kempston;
+        if (pad & 0x10){                             // the port's FIRE bit
+          this.method2 = CTRL_KEMPSTON;
+          indepGamepads = ((this.method1 & 3) === CTRL_KEMPSTON);
+        } else if ((this.method2 & 3) === CTRL_KEMPSTON &&
+                   input.kb.down(CTRL_KEYS[3][1][4])){
+          this.method2 = 3;                          // the keyboard claims him back
+        }
+      }
       this.players[0].dir = controlRead(this.method1, 0, input.kb);
       this.players[1].dir = controlRead(this.method2, 1, input.kb);
       return;
@@ -4633,6 +4690,28 @@ class Game{
     this.shot.x = 0xFF;                                  // $9484 -- see above
     this.p14 &= 0x80;                                    // $948C AND $80
     this.installArmour();       // the inventory bit moved: $AB6F's row again
+  }
+  /* ADDED -- START MEANS START.  The streamlined options screen ends on a
+     button that says START GAME with the players already named, so the
+     handover (feHandover) joins exactly those players HERE -- by pressing
+     FIRE on their behalf through the REAL join above ($9440..$948C:
+     placement, stat reset, armour row, refusal semantics and all) --
+     instead of landing on the ranked table to ask, via PRESS FIRE, for a
+     decision the player has just made.  Reported from play: "when a player
+     presses start there should be an expectation to start the game".
+     One player configured joins player 1 only; player 2 still drops in
+     mid-game through joinPass exactly as $9432 always allowed.  Dungeon 1
+     never refuses a placement ($945A DEC A / JR z), so a boot-time join
+     cannot bounce.  The faithful front end never reaches this (it sets no
+     playersOut): its handover still lands on the attract loop and waits
+     for FIRE, exactly as $B374 does. */
+  autoJoin(n){
+    for (const q of this.players.slice(0, n & 3)){
+      const save = this.p, saveDir = q.dir;
+      this.p = q; q.dir = DIR_FIRE;                      // the $944C gate, satisfied
+      this.joinOne();                                    // the real join
+      q.dir = saveDir; this.p = save;
+    }
   }
 
   /* ====================================================================
@@ -10185,8 +10264,15 @@ function feHandover(){
               method1: frontend.FFFC, method2: frontend.FFFB,
               buildSeed: freshBuildSeed(),
               indepGamepads: frontend.indepOut,
-              zonePotion: frontend.zoneOut});
+              zonePotion: frontend.zoneOut,
+              deviceJoin: frontend.deviceOut});
   game.enterAttract();
+  /* START MEANS START -- see Game.autoJoin.  The streamlined screen names
+     its players (playersOut 1 or 2); they join here through the real join,
+     and the first attractTick's own $B47E arm carries them straight into
+     the dungeon -- the ranked table never draws.  The faithful front end
+     sets no playersOut and keeps the original flow: attract until FIRE. */
+  if (frontend.playersOut) game.autoJoin(frontend.playersOut);
   feRunning = false;
 }
 /* Any gesture will do, and a CLICK must count: with the tape prompts

@@ -7770,6 +7770,182 @@ if (process.argv[2] === '--table') {
     G.seed({});                              // back to the gate baseline
   }
 
+  /* --- START MEANS START: the handover joins the configured players ------
+     Reported from play: pressing START GAME and then landing on the ranked
+     table with PRESS FIRE is asking for a decision the player has just
+     made.  The streamlined handover now presses FIRE on the configured
+     players' behalf through the REAL join ($9440..$948C -- see
+     Game.autoJoin); the faithful front end sets no playersOut and keeps
+     $B374's flow: attract until FIRE. */
+  const driveLiveToOptions = () => {
+    F.live.reset();
+    const kb = F.liveKb; kb.releaseAll();
+    let n = 0;
+    while (n < 6000 && F.live.phase !== 'options'){
+      if (n % 16 < 6) kb.press('SPACE'); else kb.releaseAll();
+      F.live.frame(kb, [], n); n++;
+    }
+    const tapLive = (key, fr) => { for (let i = 0; i < (fr || 2); i++){
+        kb.press(key); F.live.frame(kb, [], n++); }
+      for (let i = 0; i < 3; i++){ kb.releaseAll(); F.live.frame(kb, [], n++); } };
+    return tapLive;
+  };
+  {
+    /* one player configured: player 1 is IN at the handover, player 2 is
+       not -- and the faithful drop-in still works mid-game. */
+    const tapLive = driveLiveToOptions();
+    F.live.optSel = F.live.optRows().findIndex(r => r.k === 'start');
+    tapLive('ENTER', 1);
+    checkTrue('1-player START: the front end is done', F.live.done);
+    check('...and reports one player to auto-join', F.live.playersOut, 1);
+    F.feHandover();
+    checkTrue('...the handover joins player 1 -- no PRESS FIRE gate',
+              G.game.players[0].inGame);
+    checkTrue('...and does NOT join player 2', !G.game.players[1].inGame);
+    G.game.attractTick({});
+    check('...and the first tick takes the $B47E arm straight to play',
+          G.game.mode, 'play');
+    G.game.onePass({ p2: { fire: true } });              // $9432, mid-game
+    checkTrue('...and player 2 can STILL drop in mid-game via FIRE',
+              G.game.players[1].inGame);
+    G.seed({});
+  }
+  {
+    /* two players configured: both join at the handover. */
+    const tapLive = driveLiveToOptions();
+    tapLive('8', 1);                                     // PLAYERS -> 2
+    F.live.optSel = F.live.optRows().findIndex(r => r.k === 'start');
+    tapLive('ENTER', 1);
+    check('2-player START reports two players to auto-join', F.live.playersOut, 2);
+    F.feHandover();
+    checkTrue('...and the handover joins BOTH players',
+              G.game.players[0].inGame && G.game.players[1].inGame);
+    G.game.attractTick({});
+    check('...straight to play', G.game.mode, 'play');
+    G.seed({});
+  }
+  {
+    /* the faithful boundary: no playersOut means $B374's own flow --
+       nobody joined, attract until FIRE. */
+    F.live.reset();
+    check('a fresh front end reports NO players to auto-join', F.live.playersOut, 0);
+    F.live.FFFF = 0; F.live.FFFE = 1; F.live.FFFC = 3; F.live.FFFB = 3;
+    F.feHandover();
+    checkTrue('a handover with no playersOut joins NOBODY -- the faithful attract',
+              !G.game.players[0].inGame && !G.game.players[1].inGame);
+    G.game.attractTick({});
+    check('...and it stays on attract until FIRE, exactly as $B374 does',
+          G.game.mode, 'attract');
+    G.seed({});
+  }
+
+  /* --- deviceJoin: an out-of-game player 2 is CLAIMED by whichever device
+     presses FIRE -----------------------------------------------------------
+     Reported from play: one player started, player 2 could only step in on
+     the keyboard -- "pressing buttons on the controller does nothing" --
+     because his method byte still said KEYBOARD and $944C only ever tests
+     the dir that method produced.  The claim (in readKeys, one line before
+     the dir read) reassigns his method so the SAME pass's untouched join
+     brings him in. */
+  {
+    /* end to end through the real handover: 1P start, P1 on KEYBOARD, then
+       pad 0's fire joins player 2 as a shared-port CONTROLLER player. */
+    const tapLive = driveLiveToOptions();
+    F.live.optSel = F.live.optRows().findIndex(r => r.k === 'start');
+    tapLive('ENTER', 1);
+    F.feHandover();
+    G.game.attractTick({});
+    checkTrue('1P game running, player 2 out', G.game.mode === 'play' &&
+              !G.game.players[1].inGame);
+    const kb = F.liveKb; kb.releaseAll();
+    kb.kempston = 0x08;                                  // pad UP only -- no claim
+    G.game.onePass({ kb });
+    checkTrue('a pad direction without FIRE claims nothing',
+              !G.game.players[1].inGame && G.game.method2 === 3);
+    kb.kempston = 0x10;                                  // pad FIRE
+    G.game.onePass({ kb });
+    checkTrue('pad FIRE joins player 2 mid-game', G.game.players[1].inGame);
+    check('...and his method is now CONTROLLER', G.game.method2, 1);
+    checkTrue('...on the SHARED port (P1 is on the keyboard): indepGamepads stays false',
+              F.indepGamepads === false);
+    kb.kempston = 0; kb.releaseAll();
+    G.seed({});
+  }
+  {
+    /* P1 on CONTROLLER: his OWN pad's fire must never join player 2 --
+       only the SECOND pad's fire can, and doing so goes independent. */
+    G.game.reset({ deviceJoin: true, method1: 1, method2: 3 });
+    const kb = new F.Keyboard();
+    kb.kempston = 0x10;                                  // player 1's own pad
+    G.game.onePass({ kb });
+    checkTrue('player 1\'s own pad fire does NOT join player 2',
+              !G.game.players[1].inGame && G.game.method2 === 3);
+    kb.kempston = 0; kb.kempston2 = 0x10;                // the second pad
+    G.game.onePass({ kb });
+    checkTrue('the SECOND pad\'s fire joins player 2', G.game.players[1].inGame);
+    check('...as CONTROLLER', G.game.method2, 1);
+    checkTrue('...with independent pads', F.indepGamepads === true);
+    G.seed({});
+  }
+  {
+    /* the claim runs both ways: an out-of-game CONTROLLER player 2 is
+       claimed back by his keyboard zone's own FIRE key. */
+    G.game.reset({ deviceJoin: true, method1: 3, method2: 1 });
+    const kb = new F.Keyboard();
+    kb.press(F.CTRL_KEYS[3][1][4]);                      // player 2's zone FIRE
+    G.game.onePass({ kb });
+    checkTrue('the keyboard zone\'s FIRE claims player 2 back',
+              G.game.players[1].inGame);
+    check('...and his method is KEYBOARD again', G.game.method2, 3);
+    G.seed({});
+  }
+  {
+    /* the faithful gate survives: deviceJoin false (every gate's default)
+       keeps $944C's rule -- a pad fire does nothing for a KEYBOARD player. */
+    G.seed({});
+    const kb = new F.Keyboard();
+    kb.kempston = 0x10;
+    G.game.onePass({ kb });
+    checkTrue('faithful default: pad fire does NOT join a KEYBOARD player 2',
+              !G.game.players[1].inGame && G.game.method2 === 3);
+    G.seed({});
+  }
+  {
+    /* the WHOLE chain for the two-controller case, through the REAL pad
+       polling: P1 configures CONTROLLER on the options screen and starts a
+       1-player game on pad 0; a SECOND physical pad then appears with FIRE
+       held, pollGamepads feeds it into kempston2, and the claim joins
+       player 2 independent -- no keyboard anywhere in the story. */
+    sandbox.navigator = { getGamepads: () => [
+      { connected: true, id: 'Pad One', axes: [0, 0], buttons: [] }] };
+    F.pollGamepads();
+    const tapLive = driveLiveToOptions();
+    F.live.optSel = F.live.optRows().findIndex(r => r.k === 'input' && r.p === 0);
+    tapLive('8', 1);                                     // P1 -> CONTROLLER
+    F.live.optSel = F.live.optRows().findIndex(r => r.k === 'start');
+    tapLive('ENTER', 1);
+    F.feHandover();
+    G.game.attractTick({});
+    checkTrue('P1 playing on pad 0, P2 out, shared-port so far',
+              G.game.mode === 'play' && G.game.method1 === 1 &&
+              !G.game.players[1].inGame && F.indepGamepads === false);
+    sandbox.navigator = { getGamepads: () => [
+      { connected: true, id: 'Pad One', axes: [0, 0], buttons: [] },
+      { connected: true, id: 'Pad Two', axes: [0, 0],
+        buttons: [{ pressed: true }] }] };             // button 0 = A = FIRE
+    F.pollGamepads();
+    G.game.onePass({ kb: F.liveKb });
+    checkTrue('a second pad\'s FIRE, through the real polling, joins player 2',
+              G.game.players[1].inGame);
+    check('...as CONTROLLER', G.game.method2, 1);
+    checkTrue('...independent: player 2 reads pad 1, player 1 keeps pad 0',
+              F.indepGamepads === true);
+    delete sandbox.navigator;
+    F.pollGamepads();
+    F.liveKb.releaseAll();
+    G.seed({});
+  }
+
   /* --- indepGamepads' own dispatch, independent of the screen -----------
      G.seed(s) is a test convenience that calls game.reset() with NO
      arguments and then pokes a fixed whitelist of fields (char, char2, x,
